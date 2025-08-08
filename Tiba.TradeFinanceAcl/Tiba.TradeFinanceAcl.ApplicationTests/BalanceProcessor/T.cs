@@ -79,6 +79,49 @@ public class AccountBalanceProcessorTests
         }
 
         [Fact]
+        public void TwoNatureAccount_ShouldCapCreditTurnoverCorrectly2()
+        {
+            // Arrange
+            var balances = new[]
+            {
+                new AccountBalanceInput
+                {
+                    AccountCode = "A",
+                    NormalBalance = BalanceNature.Debit,
+                    OpeningBalance = 1000m,
+                    ClosingBalance = 0m,
+                    OppositeAccountCode = "B"
+                },
+                new AccountBalanceInput
+                {
+                    AccountCode = "B",
+                    NormalBalance = BalanceNature.Credit,
+                    OpeningBalance = 0m,
+                    ClosingBalance = 100m,
+                    OppositeAccountCode = "A"
+                }
+            };
+            var entries = new[]
+            {
+                new JournalEntry { AccountCode = "A", TotalDebit = 0m, TotalCredit = 1000m, Date = DateTime.Today },
+                new JournalEntry { AccountCode = "B", TotalDebit = 0m, TotalCredit = 600m, Date = DateTime.Today }
+            };
+
+            // Act
+            var results = AccountBalanceProcessor.Process(balances, entries);
+            var aResult = results.Single(r => r.AccountCode == "A");
+            var bResult = results.Single(r => r.AccountCode == "B");
+
+            // Assert A
+            aResult.TotalTurnover.Should().Be(1000m);
+            aResult.TotalTurnoverNature.Should().Be(BalanceNature.Credit);
+
+            // Assert B
+            bResult.TotalTurnover.Should().Be(600m);
+            bResult.TotalTurnoverNature.Should().Be(BalanceNature.Credit);
+        }
+
+        [Fact]
         public void NoJournalEntries_ShouldReturnZeroTurnoverAndCorrectDifference()
         {
             // Arrange
@@ -110,26 +153,50 @@ public class AccountBalanceProcessorTests
             // Arrange
             var balances = new List<AccountBalanceInput>
             {
-                new AccountBalanceInput
+                new()
                 {
-                    AccountCode = "C",
-                    NormalBalance = BalanceNature.Debit,
-                    OpeningBalance = 300m,
-                    ClosingBalance = 50m,
-                    OppositeAccountCode = "D"
+                    AccountCode = "C", NormalBalance = BalanceNature.Debit, OpeningBalance = 300m, ClosingBalance = 50m, OppositeAccountCode = "D"
+                },
+                new()
+                {
+                    AccountCode = "D", NormalBalance = BalanceNature.Credit, OpeningBalance = 0m, ClosingBalance = 0m, OppositeAccountCode = "C"
                 }
             };
             var entries = new List<JournalEntry>
             {
-                new JournalEntry { AccountCode = "C", TotalDebit = 100m, TotalCredit = 0m, Date = DateTime.Today },
-                new JournalEntry { AccountCode = "D", TotalDebit = 0m, TotalCredit = 400m, Date = DateTime.Today }
+                new() { AccountCode = "C", TotalDebit = 100m, TotalCredit = 0m, Date = DateTime.Today },
+                new() { AccountCode = "D", TotalDebit = 0m, TotalCredit = 400m, Date = DateTime.Today }
             };
 
             // Act
-            var result = AccountBalanceProcessor.Process(balances, entries).Single();
+            var results = AccountBalanceProcessor.Process(balances, entries);
+            var aResult = results.Single(r => r.AccountCode == "C");
+            var bResult = results.Single(r => r.AccountCode == "D");
 
             // Assert
-            result.TotalTurnover.Should().Be(50m);
-            result.TotalTurnoverNature.Should().Be(BalanceNature.Debit);
+            aResult.Should().BeEquivalentTo(new AccountTurnoverResult
+            {
+                AccountCode = "C",
+                OpeningBalance = 300m,
+                OpeningBalanceNature = BalanceNature.Debit,
+                TotalTurnover = 300m,
+                TotalTurnoverNature = BalanceNature.Credit,
+                ClosingBalance = 50m,
+                ClosingBalanceNature = BalanceNature.Debit,
+                Difference = 50,
+                DifferenceNature = BalanceNature.Credit
+            });
+            bResult.Should().BeEquivalentTo(new 
+            {
+                AccountCode = "D",
+                OpeningBalance = 0m,
+                OpeningBalanceNature = BalanceNature.Credit,
+                TotalTurnover = 0m,
+                TotalTurnoverNature = BalanceNature.Credit,
+                ClosingBalance = 0m,
+                ClosingBalanceNature = BalanceNature.Credit,
+                Difference = 0,
+            });
+
         }
     }

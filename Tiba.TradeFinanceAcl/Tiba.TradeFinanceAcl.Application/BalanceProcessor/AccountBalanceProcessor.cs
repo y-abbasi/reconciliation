@@ -1,114 +1,99 @@
+using Newtonsoft.Json;
+
 namespace Tiba.TradeFinanceAcl.Application.BalanceProcessor;
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
-   
-    public static class AccountBalanceProcessor
+public static class AccountBalanceProcessor
+{
+    /// <summary>
+    /// Processes journal entries and balances, handling two-nature accounts by pooling turnovers
+    /// and allocating against opening balances.
+    /// </summary>
+    public static List<AccountTurnoverResult> Process(
+        IEnumerable<AccountBalanceInput> balances,
+        IEnumerable<JournalEntry> entries)
     {
-        public static List<AccountTurnoverResult> Process(
-            IEnumerable<AccountBalanceInput> balances,
-            IEnumerable<JournalEntry> entries)
+        var balanceList = balances.ToList();
+
+        // Compute net turnover per account from journal
+        var netMap = entries
+            .GroupBy(e => e.AccountCode)
+            .ToDictionary(g => g.Key, g => ComputeNet(g));
+
+        var results = new List<AccountTurnoverResult>();
+        var processed = new HashSet<string>();
+
+        foreach (var bal in balanceList)
         {
-            var balanceList = balances.ToList();
-            var entriesByAccount = entries
-                .GroupBy(e => e.AccountCode)
-                .ToDictionary(g => g.Key, g => g.ToList());
-
-            var results = new List<AccountTurnoverResult>();
-
-            foreach (var balance in balanceList)
+            if (!string.IsNullOrEmpty(bal.OppositeAccountCode)
+                && balanceList.Any(b => b.AccountCode == bal.OppositeAccountCode)
+                && !processed.Contains(bal.AccountCode)
+                && !processed.Contains(bal.OppositeAccountCode))
             {
-                var related = new List<JournalEntry>();
-
-                // Add entries posted directly to this account
-                if (entriesByAccount.TryGetValue(balance.AccountCode, out var ownEntries))
-                    related.AddRange(ownEntries);
-
-                // Include opposite entries
-                if (!string.IsNullOrEmpty(balance.OppositeAccountCode) &&
-                    entriesByAccount.TryGetValue(balance.OppositeAccountCode, out var oppEntries))
+                // Two-nature pair
+                var opp = balanceList.First(b => b.AccountCode == bal.OppositeAccountCode);
+                var (net1, nat1) = netMap.GetValueOrDefault(bal.AccountCode, (0m, BalanceNature.Debit));
+                var (net2, nat2) = netMap.GetValueOrDefault(opp.AccountCode, (0m, BalanceNature.Debit));
+                var (pool, nature) =
+                    nat1 == nat2 ? (net1 + net2, nat1) : (Math.Abs(net1 - net2), net1 > net2 ? nat1 : nat2);
                 {
-                    // If the opposite account has a defined balance, include direct entries
-                    bool oppHasBalance = balanceList.Any(b => b.AccountCode == balance.OppositeAccountCode);
-                    if (oppHasBalance)
-                    {
-                        related.AddRange(oppEntries);
-                    }
-                    else
-                    {
-                        // Otherwise invert debit/credit
-                        related.AddRange(oppEntries.Select(e => new JournalEntry
-                        {
-                            AccountCode = balance.AccountCode,
-                            TotalDebit = e.TotalCredit,
-                            TotalCredit = e.TotalDebit,
-                            Date = e.Date
-                        }));
-                    }
+                    // Allocate to first by opening
+                    decimal alloc1 = Math.Min(pool, bal.OpeningBalance);
+                    decimal alloc2 = pool - alloc1;
+
+                    results.Add(CreateResult(bal, alloc1, nature));
+                    results.Add(CreateResult(opp, alloc2, nature));
+                    processed.Add(bal.AccountCode);
+                    processed.Add(opp.AccountCode);
+                    continue;
                 }
-
-                // Calculate net turnover
-                var (net, nature) = related.Any()
-                    ? NetTurnover(related)
-                    : (0m, BalanceNature.Debit);
-
-                // Cap turnover
-                net = CapTurnover(net, nature, balance);
-
-                // Build result
-                results.Add(CalcResult(balance, net, nature));
             }
 
-            return results;
+            if (processed.Contains(bal.AccountCode)) continue;
+
+            // Single-nature or unmatched
+            var (net, nat) = netMap.GetValueOrDefault(bal.AccountCode, (0m, BalanceNature.Debit));
+            // Cap to opening if opening>0
+            decimal alloc = bal.OpeningBalance > 0 ? Math.Min(net, bal.OpeningBalance) : net;
+            results.Add(CreateResult(bal, alloc, nat));
         }
 
-        private static (decimal net, BalanceNature nature) NetTurnover(IEnumerable<JournalEntry> ent)
-        {
-            decimal totalDebits = ent.Sum(x => x.TotalDebit);
-            decimal totalCredits = ent.Sum(x => x.TotalCredit);
-            if (totalCredits >= totalDebits)
-                return (totalCredits - totalDebits, BalanceNature.Credit);
-            return (totalDebits - totalCredits, BalanceNature.Debit);
-        }
-
-        private static decimal CapTurnover(decimal net, BalanceNature nature, AccountBalanceInput bal)
-        {
-            if (nature == BalanceNature.Credit)
-            {
-                return bal.NormalBalance == BalanceNature.Debit
-                    ? Math.Min(net, bal.OpeningBalance)
-                    : Math.Min(net, bal.ClosingBalance);
-            }
-            return bal.NormalBalance == BalanceNature.Credit
-                ? Math.Min(net, bal.OpeningBalance)
-                : Math.Min(net, bal.ClosingBalance);
-        }
-
-        private static AccountTurnoverResult CalcResult(
-            AccountBalanceInput bal,
-            decimal net,
-            BalanceNature nat)
-        {
-            decimal opSigned = bal.NormalBalance == BalanceNature.Debit ? bal.OpeningBalance : -bal.OpeningBalance;
-            decimal turnSigned = nat == BalanceNature.Debit ? net : -net;
-            decimal clSigned = bal.NormalBalance == BalanceNature.Debit ? bal.ClosingBalance : -bal.ClosingBalance;
-
-            decimal diff = opSigned + turnSigned - clSigned;
-            var diffNature = diff >= 0 ? BalanceNature.Debit : BalanceNature.Credit;
-
-            return new AccountTurnoverResult
-            {
-                AccountCode = bal.AccountCode,
-                OpeningBalance = bal.OpeningBalance,
-                OpeningBalanceNature = bal.NormalBalance,
-                TotalTurnover = net,
-                TotalTurnoverNature = nat,
-                ClosingBalance = bal.ClosingBalance,
-                ClosingBalanceNature = bal.NormalBalance,
-                Difference = Math.Abs(diff),
-                DifferenceNature = diffNature
-            };
-        }
+        return results;
     }
+
+    private static (decimal net, BalanceNature nature) ComputeNet(IEnumerable<JournalEntry> entries)
+    {
+        var deb = entries.Sum(e => e.TotalDebit);
+        var cr = entries.Sum(e => e.TotalCredit);
+        return cr >= deb ? (cr - deb, BalanceNature.Credit) : (deb - cr, BalanceNature.Debit);
+    }
+
+    private static AccountTurnoverResult CreateResult(
+        AccountBalanceInput bal,
+        decimal net,
+        BalanceNature nat)
+    {
+        var openingSigned = bal.NormalBalance == BalanceNature.Debit ? bal.OpeningBalance : -bal.OpeningBalance;
+        var turnoverSigned = nat == BalanceNature.Debit ? net : -net;
+        var closingSigned = bal.NormalBalance == BalanceNature.Debit ? bal.ClosingBalance : -bal.ClosingBalance;
+
+        var diff = openingSigned + turnoverSigned - closingSigned;
+        var diffNat = diff >= 0 ? BalanceNature.Debit : BalanceNature.Credit;
+
+        return new AccountTurnoverResult
+        {
+            AccountCode = bal.AccountCode,
+            OpeningBalance = bal.OpeningBalance,
+            OpeningBalanceNature = bal.NormalBalance,
+            TotalTurnover = net,
+            TotalTurnoverNature = nat,
+            ClosingBalance = bal.ClosingBalance,
+            ClosingBalanceNature = bal.NormalBalance,
+            Difference = Math.Abs(diff),
+            DifferenceNature = diffNat
+        };
+    }
+}
